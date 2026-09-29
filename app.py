@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from transfer.actions import TransferActions
+from transfer.records import TransferRecords
+from transfer import permissions as transfer_permissions
+from transfer.permissions import TransferPermissionError
+from transfer.rules import TransferRuleError
+
 PORT = 8201
 ROLES = {"reporter", "regional_lead", "medical_reviewer", "global_admin"}
 
@@ -151,6 +157,8 @@ class Repository:
             );
             """
         )
+        # 增量升级：补装跨区域移交申请表，不改动既有表与旧案例历史
+        TransferRecords(self.conn).install()
 
     @staticmethod
     def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -167,6 +175,7 @@ class Repository:
 class PharmacovigilanceService:
     def __init__(self, db_path: str | Path):
         self.repo = Repository(db_path)
+        self.transfers = TransferActions(self, audit=Repository.audit)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -242,6 +251,7 @@ class PharmacovigilanceService:
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
             "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
+            "transfers": self.transfers.case_transfers(conn, case_id) if transfer_permissions.can_view_all(role) or role == "regional_lead" else [],
             "audit": [dict(r) for r in conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE case_id=? ORDER BY id", (case_id,))] if role in {"medical_reviewer", "global_admin"} else [],
         }
 
@@ -271,6 +281,8 @@ class PharmacovigilanceService:
                 raise ApiError(403, "followup_forbidden", "当前角色不能提交随访")
             if case["status"] == "merged":
                 raise ApiError(409, "case_merged", "已合并案例不能再更新")
+            if TransferRecords(conn).pending_for_case(case_id):
+                raise ApiError(409, "transfer_pending", "案例正在等待跨区域移交，暂停随访提交")
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例已被其他人员更新，请重新读取")
             revision = case["revision"] + 1
@@ -351,6 +363,8 @@ class PharmacovigilanceService:
                 raise ApiError(403, "region_forbidden", "无权提交其他区域报告")
             if row["status"] == "submitted":
                 return {"report": dict(row), "idempotent": True}
+            if TransferRecords(conn).pending_for_case(row["case_id"]):
+                raise ApiError(409, "transfer_pending", "案例正在等待跨区域移交，暂停报告提交")
             now = parse_time(body.get("submitted_at"), utcnow())
             late = int(now > parse_time(row["due_at"]))
             conn.execute("UPDATE reports SET status='submitted',submitted_at=?,submitted_by=?,late=? WHERE id=?", (iso(now), actor, late, report_id))
@@ -370,6 +384,8 @@ class PharmacovigilanceService:
                 return {"case": dict(source), "idempotent": True}
             if target["status"] == "merged" or source["product"].casefold() != target["product"].casefold():
                 raise ApiError(409, "merge_conflict", "目标案例不可用，或产品与来源案例不一致")
+            if TransferRecords(conn).pending_for_case(source_id) or TransferRecords(conn).pending_for_case(target_id):
+                raise ApiError(409, "transfer_pending", "案例正在等待跨区域移交，不能合并")
             conn.execute("UPDATE cases SET status='merged',merged_into=?,revision=revision+1,updated_at=? WHERE id=?", (target_id, iso(), source_id))
             conn.execute("UPDATE intakes SET case_id=? WHERE case_id=?", (target_id, source_id))
             Repository.audit(conn, target_id, actor, role, "case_merged_in", {"source_case_id": source_id})
@@ -437,9 +453,13 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path == "/api/transfers":
+            return 200, self.service.transfers.list_requests(role, region, query)
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
+        if len(parts) == 3 and parts[:2] == ["api", "transfers"] and parts[2].isdigit():
+            return 200, self.service.transfers.get_request(int(parts[2]), role, region)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _dispatch_post(self, path: str, body: dict[str, Any]) -> Any:
@@ -459,6 +479,16 @@ class Handler(BaseHTTPRequestHandler):
                 return 201, self.service.create_report(case_id, actor, role, region, body)
             if action == "merge":
                 return 200, self.service.merge_cases(case_id, actor, role, body)
+            if action == "transfers":
+                return 201, self.service.transfers.request_transfer(case_id, actor, role, region, body)
+        if len(parts) == 4 and parts[:2] == ["api", "transfers"] and parts[2].isdigit():
+            transfer_id, action = int(parts[2]), parts[3]
+            if action == "accept":
+                return 200, self.service.transfers.accept(transfer_id, actor, role, region)
+            if action == "reject":
+                return 200, self.service.transfers.reject(transfer_id, actor, role, region, body)
+            if action == "cancel":
+                return 200, self.service.transfers.cancel(transfer_id, actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "submit":
             return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
         raise ApiError(404, "not_found", "接口不存在")
@@ -480,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
                 status, payload = self._dispatch_post(parsed.path, self._body())
             json_response(self, status, payload)
         except ApiError as exc:
+            json_response(self, exc.status, {"error": exc.code, "message": exc.message})
+        except (TransferRuleError, TransferPermissionError) as exc:
             json_response(self, exc.status, {"error": exc.code, "message": exc.message})
         except Exception as exc:
             print(f"unhandled error: {exc!r}")

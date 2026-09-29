@@ -1,5 +1,93 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒案例台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}</style>
-<h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
-<section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新案例</button><pre id="out"></pre></section>
-<script>async function load(){let h={'X-User-Id':user.value,'X-Role':role.value};let r=await fetch('/api/state',{headers:h});out.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1180px;margin:32px auto;padding:0 20px;background:#f5f7fa;color:#172033}
+section{background:white;padding:18px 20px;margin:14px 0;border-radius:12px;box-shadow:0 2px 12px #0001}
+input,textarea,button,select{font:inherit;padding:8px;margin:4px}input,textarea,select{width:auto}
+button{background:#174ea6;color:white;border:0;border-radius:6px;cursor:pointer}button.ghost{background:#5f6b7a}
+button.danger{background:#b3261e}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #e5e9f0;padding:6px 8px;text-align:left;font-size:13px}
+pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto;max-height:340px}.tag{padding:2px 8px;border-radius:10px;font-size:12px;color:white}
+.pending{background:#b06000}.accepted{background:#1e7d32}.rejected{background:#b3261e}.cancelled{background:#5f6b7a}
+label{font-size:13px;color:#445}#msg{min-height:20px;color:#b3261e}</style>
+<h1>药物警戒案例台</h1><p>标准库 JSON API。区域角色需带 X-Region；跨区域移交由「原区域发起、目标区域接受」。</p>
+<section>
+  <h2>当前身份</h2>
+  <input id="user" value="lead-cn" style="width:130px">
+  <select id="role"><option>regional_lead</option><option>reporter</option><option>medical_reviewer</option><option>global_admin</option></select>
+  <input id="region" value="CN" style="width:90px" placeholder="X-Region">
+  <button onclick="loadAll()">刷新</button>
+  <span id="msg"></span>
+</section>
+<section>
+  <h2>案例与发起移交</h2>
+  <table><thead><tr><th>ID</th><th>编号</th><th>区域</th><th>产品/事件</th><th>版本</th><th>状态</th><th>操作</th></tr></thead><tbody id="cases"></tbody></table>
+</section>
+<section>
+  <h2>移交申请</h2>
+  <table><thead><tr><th>ID</th><th>案例</th><th>原→目标</th><th>读取版本</th><th>原因</th><th>状态</th><th>处理理由</th><th>操作</th></tr></thead><tbody id="transfers"></tbody></table>
+</section>
+<pre id="out">// 接口响应将显示在这里</pre>
+
+<div id="dialog" style="display:none;position:fixed;inset:0;background:#0008;z-index:9">
+  <section style="max-width:520px;margin:80px auto">
+    <h2 id="dlgTitle">发起跨区域移交</h2>
+    <input id="dlgCase" readonly style="width:90%;background:#eee"><br>
+    <label>目标区域</label><input id="dlgTarget" value="EU" style="width:90%"><br>
+    <label>移交原因</label><textarea id="dlgReason" rows="3" style="width:90%"></textarea><br>
+    <label>读取版本（必须与案例当前版本一致）</label><input id="dlgRevision" readonly style="width:90%;background:#eee"><br>
+    <button onclick="submitCreate()">提交申请</button>
+    <button class="ghost" onclick="closeDlg()">取消</button>
+  </section>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+function headers(){return {'X-User-Id':$('user').value,'X-Role':$('role').value,'X-Region':$('region').value};}
+function show(msg){$('msg').textContent=msg||'';}
+async function api(path,opts){
+  const r=await fetch(path,Object.assign({headers:Object.assign({'Content-Type':'application/json'},headers())},opts));
+  const data=await r.json(); $('out').textContent=JSON.stringify(data,null,2);
+  if(!r.ok){show((data.message||data.error||'请求失败')); throw new Error(data.error);}
+  show(''); return data;
+}
+async function loadAll(){
+  try{
+    const [{cases},{transfers}]=await Promise.all([
+      api('/api/state'), api('/api/transfers')
+    ]);
+    $('cases').innerHTML=cases.map(c=>`<tr>
+      <td>${c.id}</td><td>${c.case_no}</td><td><b>${c.region}</b></td>
+      <td>${c.product} / ${c.event_term}</td><td>${c.revision}</td><td>${c.status}</td>
+      <td><button onclick="openCreate(${c.id},${c.revision},'${c.region}')">发起移交</button></td></tr>`).join('');
+    const tag=s=>`<span class="tag ${s}">${s}</span>`;
+    $('transfers').innerHTML=transfers.map(t=>`<tr>
+      <td>${t.id}</td><td>#${t.case_id}</td><td>${t.from_region} → ${t.to_region}</td>
+      <td>${t.case_revision}</td><td>${t.reason}</td><td>${tag(t.status)}</td>
+      <td>${t.decision_reason||''}</td>
+      <td>${t.status==='pending'?`
+        <button onclick="decide(${t.id},'accept')">接受</button>
+        <button class="danger" onclick="decide(${t.id},'reject')">拒绝</button>
+        <button class="ghost" onclick="decide(${t.id},'cancel')">管理员撤销</button>`:''}</td></tr>`).join('');
+  }catch(e){}
+}
+function openCreate(id,revision,region){
+  $('dlgCase').value=`案例 #${id}（当前区域 ${region}）`;
+  $('dlgRevision').value=revision; $('dlgReason').value=''; $('dlgTarget').value='';
+  $('dialog').style.display='block';
+}
+function closeDlg(){$('dialog').style.display='none';}
+async function submitCreate(){
+  const id=+$('dlgCase').value.match(/#(\d+)/)[1];
+  try{
+    await api(`/api/cases/${id}/transfers`,{method:'POST',body:JSON.stringify({
+      target_region:$('dlgTarget').value.trim(), reason:$('dlgReason').value.trim(),
+      read_revision:+(+$('dlgRevision').value)
+    })});
+    closeDlg(); loadAll();
+  }catch(e){}
+}
+async function decide(id,action){
+  let body='{}';
+  if(action==='reject'){const reason=prompt('请填写拒绝理由：');if(reason===null)return;body=JSON.stringify({reason});}
+  try{ await api(`/api/transfers/${id}/${action}`,{method:'POST',body}); loadAll(); }catch(e){}
+}
+loadAll();
+</script>
