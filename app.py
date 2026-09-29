@@ -13,16 +13,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from errors import ApiError
+from transfer_records import TransferStore
+from transfer_service import TransferService
+
 PORT = 8201
 ROLES = {"reporter", "regional_lead", "medical_reviewer", "global_admin"}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message)
-        self.status = status
-        self.code = code
-        self.message = message
 
 
 def utcnow() -> datetime:
@@ -62,6 +58,8 @@ class Repository:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.init_schema()
+        # 跨区域移交数据表独立维护，旧库仅追加新表，历史案例继续可查
+        TransferStore(self.conn).init_schema()
 
     @contextmanager
     def tx(self):
@@ -167,6 +165,7 @@ class Repository:
 class PharmacovigilanceService:
     def __init__(self, db_path: str | Path):
         self.repo = Repository(db_path)
+        self.transfers = TransferService(self.repo)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -242,6 +241,7 @@ class PharmacovigilanceService:
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
             "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
+            "transfers": self.transfers.list_transfers(role, region, case_id=case_id) if role != "reporter" else [],
             "audit": [dict(r) for r in conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE case_id=? ORDER BY id", (case_id,))] if role in {"medical_reviewer", "global_admin"} else [],
         }
 
@@ -271,6 +271,8 @@ class PharmacovigilanceService:
                 raise ApiError(403, "followup_forbidden", "当前角色不能提交随访")
             if case["status"] == "merged":
                 raise ApiError(409, "case_merged", "已合并案例不能再更新")
+            # 跨区域移交等待期间暂停随访
+            self.transfers.freeze_guard(case_id, "followup")
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例已被其他人员更新，请重新读取")
             revision = case["revision"] + 1
@@ -351,6 +353,8 @@ class PharmacovigilanceService:
                 raise ApiError(403, "region_forbidden", "无权提交其他区域报告")
             if row["status"] == "submitted":
                 return {"report": dict(row), "idempotent": True}
+            # 跨区域移交等待期间暂停新的报告提交（已提交的幂等回放不受影响）
+            self.transfers.freeze_guard(row["case_id"], "report_submission")
             now = parse_time(body.get("submitted_at"), utcnow())
             late = int(now > parse_time(row["due_at"]))
             conn.execute("UPDATE reports SET status='submitted',submitted_at=?,submitted_by=?,late=? WHERE id=?", (iso(now), actor, late, report_id))
@@ -396,7 +400,9 @@ class PharmacovigilanceService:
 
     def state(self, role: str, region: str) -> dict[str, Any]:
         cases = self.list_cases(role, region, {})
-        return {"cases": cases, "overdue": self.overdue(role, region), "server_time": iso()}
+        transfers = [] if role == "reporter" else self.transfers.list_transfers(role, region)
+        return {"cases": cases, "overdue": self.overdue(role, region),
+                "transfers": transfers, "server_time": iso()}
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -411,6 +417,8 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) ->
 class Handler(BaseHTTPRequestHandler):
     service: PharmacovigilanceService
     web_root: Path
+    transfer_get: Any = None
+    transfer_post: Any = None
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.address_string()} - {fmt % args}")
@@ -437,12 +445,20 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path.startswith("/api/transfers") and self.transfer_get:
+            handled = self.transfer_get(path, query)
+            if handled is not None:
+                return handled
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _dispatch_post(self, path: str, body: dict[str, Any]) -> Any:
+        if path.startswith("/api/transfers") or path.endswith("/transfers"):
+            handled = self.transfer_post(path, body) if self.transfer_post else None
+            if handled is not None:
+                return handled
         actor, role, region = self.service.identity(self.headers)
         if path == "/api/cases":
             return 201, self.service.create_case(actor, role, region, body)
@@ -463,6 +479,19 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
         raise ApiError(404, "not_found", "接口不存在")
 
+    def _serve_static(self, path: str) -> None:
+        name = path.removeprefix("/static/")
+        target = (self.web_root / name).resolve()
+        if self.web_root.resolve() not in target.parents or not target.is_file():
+            raise ApiError(404, "not_found", "静态资源不存在")
+        content_type = "application/javascript; charset=utf-8" if target.suffix == ".js" else "application/octet-stream"
+        page = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        self.wfile.write(page)
+
     def _handle(self, method: str) -> None:
         parsed = urlparse(self.path)
         try:
@@ -473,6 +502,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(page)))
                 self.end_headers()
                 self.wfile.write(page)
+                return
+            if method == "GET" and parsed.path.startswith("/static/"):
+                self._serve_static(parsed.path)
                 return
             if method == "GET":
                 status, payload = self._dispatch_get(parsed.path, parse_qs(parsed.query))
@@ -496,6 +528,9 @@ def create_server(db_path: str | Path, host: str = "127.0.0.1", port: int = PORT
     service = PharmacovigilanceService(db_path)
     web_root = Path(__file__).resolve().parent / "static"
     handler = type("PharmacovigilanceHandler", (Handler,), {"service": service, "web_root": web_root})
+    # 页面操作模块独立注册，路由变化只需调整 transfer_pages
+    import transfer_pages
+    transfer_pages.register(handler)
     return ThreadingHTTPServer((host, port), handler)
 
 
